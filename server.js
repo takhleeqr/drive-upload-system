@@ -11,8 +11,9 @@ const PORT = process.env.PORT || 3000;
 // Configuration
 const CONFIG = {
     MAIN_FOLDER_ID: '1oN7WEEVfUnni6g20nyViajXEtGRW6Fp7',
-    MAX_FILE_SIZE: 1024 * 1024 * 1024, // 1GB per file
-    MAX_FILES: 10, // Maximum files per upload
+    MAX_FILE_SIZE: 2 * 1024 * 1024 * 1024, // 2GB per file
+    MAX_TOTAL_SIZE: 5 * 1024 * 1024 * 1024, // 5GB total upload
+    MAX_FILES: 500, // Maximum files per upload
     CHUNK_SIZE: 8 * 1024 * 1024 // 8MB chunks for resumable upload
 };
 
@@ -129,7 +130,16 @@ app.post('/api/upload', upload.array('files'), async (req, res) => {
             });
         }
         
-        console.log(`Starting chunked upload of ${req.files.length} files to folder ${folderId}`);
+        // Check total upload size
+        const totalSize = req.files.reduce((sum, file) => sum + file.size, 0);
+        if (totalSize > CONFIG.MAX_TOTAL_SIZE) {
+            return res.status(400).json({
+                success: false,
+                error: `Total upload size (${formatFileSize(totalSize)}) exceeds limit of ${formatFileSize(CONFIG.MAX_TOTAL_SIZE)}`
+            });
+        }
+        
+        console.log(`Starting chunked upload of ${req.files.length} files (${formatFileSize(totalSize)}) to folder ${folderId}`);
         
         // Process files one by one to avoid memory issues
         const results = [];
@@ -156,10 +166,11 @@ app.post('/api/upload', upload.array('files'), async (req, res) => {
             summary: {
                 total: results.length,
                 successful: successful.length,
-                failed: failed.length
+                failed: failed.length,
+                totalSize: formatFileSize(totalSize)
             },
             message: failed.length === 0 ? 
-                `All ${successful.length} files uploaded successfully!` : 
+                `All ${successful.length} files (${formatFileSize(totalSize)}) uploaded successfully!` : 
                 `${successful.length} uploaded, ${failed.length} failed`
         });
         
@@ -175,12 +186,18 @@ async function getOrCreateFolderPath({ modelName, platform, category, scriptTitl
     
     // Build folder path
     folderPath.push(modelName);
-    folderPath.push(platform === 'of' ? 'OF Profile' : 
+    folderPath.push(platform === 'of' ? 'OF' : 
                    platform.charAt(0).toUpperCase() + platform.slice(1));
     folderPath.push(category);
     
+    // Add script title folder for Scripts category
     if (category === 'Scripts' && scriptTitle) {
         folderPath.push(scriptTitle);
+    }
+    
+    // Add "Not Uploaded" folder for OF Feed Posts and Stories
+    if (platform === 'of' && (category === 'Feed Posts' || category === 'Stories')) {
+        folderPath.push('Not Uploaded');
     }
     
     // Create folder hierarchy
@@ -237,34 +254,25 @@ async function createFolder(name, parentId) {
     }
 }
 
-// Enhanced file upload function with resumable upload for large files
+// Enhanced file upload function with smart filename handling
 async function uploadFileToDrive(file, folderId) {
     try {
-        console.log(`Starting upload: ${file.originalname} (${file.size} bytes)`);
+        console.log(`Starting upload: ${file.originalname} (${formatFileSize(file.size)})`);
         
-        // Check if file already exists
-        const existingFiles = await driveService.files.list({
-            q: `name='${file.originalname}' and '${folderId}' in parents and trashed=false`,
-            fields: 'files(id, name)'
-        });
+        // Get a unique filename for this folder
+        const finalFileName = await getUniqueFileName(file.originalname, folderId);
         
-        if (existingFiles.data.files.length > 0) {
-            console.log(`File already exists: ${file.originalname}`);
-            return {
-                success: true,
-                fileName: file.originalname,
-                fileId: existingFiles.data.files[0].id,
-                message: 'File already exists'
-            };
+        if (finalFileName !== file.originalname) {
+            console.log(`Renamed file: ${file.originalname} → ${finalFileName}`);
         }
         
         // Use resumable upload for files larger than 5MB
         if (file.size > 5 * 1024 * 1024) {
-            console.log(`Using resumable upload for large file: ${file.originalname}`);
-            return await resumableUpload(file, folderId);
+            console.log(`Using resumable upload for large file: ${finalFileName}`);
+            return await resumableUpload(file, folderId, finalFileName);
         } else {
-            console.log(`Using simple upload for small file: ${file.originalname}`);
-            return await simpleUpload(file, folderId);
+            console.log(`Using simple upload for small file: ${finalFileName}`);
+            return await simpleUpload(file, folderId, finalFileName);
         }
         
     } catch (error) {
@@ -277,11 +285,68 @@ async function uploadFileToDrive(file, folderId) {
     }
 }
 
+// Helper function to get unique filename in folder
+async function getUniqueFileName(originalName, folderId) {
+    try {
+        // Check if original filename exists
+        const existingFiles = await driveService.files.list({
+            q: `name='${originalName}' and '${folderId}' in parents and trashed=false`,
+            fields: 'files(id, name)'
+        });
+        
+        // If no conflict, use original name
+        if (existingFiles.data.files.length === 0) {
+            return originalName;
+        }
+        
+        // Generate numbered filename
+        const { name, ext } = parseFileName(originalName);
+        let counter = 1;
+        let newFileName;
+        
+        do {
+            newFileName = `${name}(${counter})${ext}`;
+            
+            const checkFiles = await driveService.files.list({
+                q: `name='${newFileName}' and '${folderId}' in parents and trashed=false`,
+                fields: 'files(id, name)'
+            });
+            
+            if (checkFiles.data.files.length === 0) {
+                return newFileName;
+            }
+            
+            counter++;
+        } while (counter < 100); // Prevent infinite loop
+        
+        // Fallback with timestamp if too many duplicates
+        const timestamp = Date.now();
+        return `${name}_${timestamp}${ext}`;
+        
+    } catch (error) {
+        console.error('Error checking filename uniqueness:', error);
+        // Fallback to original name if check fails
+        return originalName;
+    }
+}
+
+// Helper function to parse filename into name and extension
+function parseFileName(filename) {
+    const lastDotIndex = filename.lastIndexOf('.');
+    if (lastDotIndex === -1) {
+        return { name: filename, ext: '' };
+    }
+    return {
+        name: filename.substring(0, lastDotIndex),
+        ext: filename.substring(lastDotIndex)
+    };
+}
+
 // Simple upload for small files
-async function simpleUpload(file, folderId) {
+async function simpleUpload(file, folderId, fileName) {
     const response = await driveService.files.create({
         requestBody: {
-            name: file.originalname,
+            name: fileName,
             parents: [folderId]
         },
         media: {
@@ -291,25 +356,27 @@ async function simpleUpload(file, folderId) {
         fields: 'id, name, size'
     });
     
-    console.log(`Successfully uploaded (simple): ${file.originalname}`);
+    console.log(`Successfully uploaded (simple): ${fileName}`);
     
     return {
         success: true,
-        fileName: file.originalname,
+        fileName: fileName,
+        originalName: file.originalname,
         fileId: response.data.id,
-        size: file.size
+        size: file.size,
+        renamed: fileName !== file.originalname
     };
 }
 
 // Resumable upload for large files
-async function resumableUpload(file, folderId) {
+async function resumableUpload(file, folderId, fileName) {
     try {
         // Step 1: Initiate resumable upload session
         const authClient = await driveService.context._options.auth.getAccessToken();
         const accessToken = authClient.token;
         
         const metadata = {
-            name: file.originalname,
+            name: fileName,
             parents: [folderId]
         };
         
@@ -330,7 +397,7 @@ async function resumableUpload(file, folderId) {
         }
         
         const uploadUrl = initResponse.headers.get('location');
-        console.log(`Resumable upload session started for: ${file.originalname}`);
+        console.log(`Resumable upload session started for: ${fileName}`);
         
         // Step 2: Upload file in chunks
         let uploadedBytes = 0;
@@ -341,7 +408,7 @@ async function resumableUpload(file, folderId) {
             const end = Math.min(uploadedBytes + chunkSize, file.size);
             const chunk = file.buffer.slice(start, end);
             
-            console.log(`Uploading chunk: ${start}-${end-1}/${file.size} for ${file.originalname}`);
+            console.log(`Uploading chunk: ${start}-${end-1}/${file.size} for ${fileName}`);
             
             const chunkResponse = await fetch(uploadUrl, {
                 method: 'PUT',
@@ -358,13 +425,15 @@ async function resumableUpload(file, folderId) {
             } else if (chunkResponse.status === 200 || chunkResponse.status === 201) {
                 // Upload complete
                 const result = await chunkResponse.json();
-                console.log(`Successfully uploaded (resumable): ${file.originalname}`);
+                console.log(`Successfully uploaded (resumable): ${fileName}`);
                 
                 return {
                     success: true,
-                    fileName: file.originalname,
+                    fileName: fileName,
+                    originalName: file.originalname,
                     fileId: result.id,
-                    size: file.size
+                    size: file.size,
+                    renamed: fileName !== file.originalname
                 };
             } else {
                 throw new Error(`Chunk upload failed: ${chunkResponse.status}`);
@@ -372,9 +441,18 @@ async function resumableUpload(file, folderId) {
         }
         
     } catch (error) {
-        console.error(`Resumable upload failed for ${file.originalname}:`, error);
+        console.error(`Resumable upload failed for ${fileName}:`, error);
         throw error;
     }
+}
+
+// Helper function to format file sizes
+function formatFileSize(bytes) {
+    if (!bytes) return '0 Bytes';
+    const k = 1024;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
 // Error handling middleware
@@ -383,7 +461,7 @@ app.use((error, req, res, next) => {
         if (error.code === 'LIMIT_FILE_SIZE') {
             return res.status(400).json({
                 success: false,
-                error: `File too large. Maximum size is ${CONFIG.MAX_FILE_SIZE / (1024*1024)}MB`
+                error: `File too large. Maximum size is ${formatFileSize(CONFIG.MAX_FILE_SIZE)}`
             });
         }
         if (error.code === 'LIMIT_FILE_COUNT') {
@@ -411,6 +489,8 @@ async function startServer() {
         console.log(`🚀 Upload server running on port ${PORT}`);
         console.log(`📁 Uploads will go to Google Drive folder: ${CONFIG.MAIN_FOLDER_ID}`);
         console.log(`🔄 Chunked upload enabled for files > 5MB`);
+        console.log(`📂 PPV category added to OF platform`);
+        console.log(`📏 Limits: ${formatFileSize(CONFIG.MAX_FILE_SIZE)} per file, ${formatFileSize(CONFIG.MAX_TOTAL_SIZE)} total, ${CONFIG.MAX_FILES} files max`);
     });
 }
 
