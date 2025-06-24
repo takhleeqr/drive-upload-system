@@ -3,6 +3,7 @@ const multer = require('multer');
 const { google } = require('googleapis');
 const path = require('path');
 const cors = require('cors');
+const { Readable } = require('stream');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -11,7 +12,8 @@ const PORT = process.env.PORT || 3000;
 const CONFIG = {
     MAIN_FOLDER_ID: '1oN7WEEVfUnni6g20nyViajXEtGRW6Fp7',
     MAX_FILE_SIZE: 1024 * 1024 * 1024, // 1GB per file
-    MAX_FILES: 10 // Maximum files per upload
+    MAX_FILES: 10, // Maximum files per upload
+    CHUNK_SIZE: 8 * 1024 * 1024 // 8MB chunks for resumable upload
 };
 
 // Middleware
@@ -108,7 +110,7 @@ app.post('/api/create-folder-path', async (req, res) => {
     }
 });
 
-// Upload files endpoint
+// Upload files endpoint with chunked upload support
 app.post('/api/upload', upload.array('files'), async (req, res) => {
     try {
         const { folderId } = req.body;
@@ -127,10 +129,23 @@ app.post('/api/upload', upload.array('files'), async (req, res) => {
             });
         }
         
-        console.log(`Uploading ${req.files.length} files to folder ${folderId}`);
+        console.log(`Starting chunked upload of ${req.files.length} files to folder ${folderId}`);
         
-        const uploadPromises = req.files.map(file => uploadFileToDrive(file, folderId));
-        const results = await Promise.all(uploadPromises);
+        // Process files one by one to avoid memory issues
+        const results = [];
+        for (const file of req.files) {
+            try {
+                const result = await uploadFileToDrive(file, folderId);
+                results.push(result);
+            } catch (error) {
+                console.error(`Failed to upload ${file.originalname}:`, error);
+                results.push({
+                    success: false,
+                    fileName: file.originalname,
+                    error: error.message
+                });
+            }
+        }
         
         const successful = results.filter(r => r.success);
         const failed = results.filter(r => !r.success);
@@ -222,10 +237,10 @@ async function createFolder(name, parentId) {
     }
 }
 
-// Helper function to upload file to Drive
-async function uploadFileToDrive(file, folderId) {
+// Enhanced file upload function with resumable upload for large files
+async function uploadFileTorive(file, folderId) {
     try {
-        console.log(`Uploading file: ${file.originalname} (${file.size} bytes)`);
+        console.log(`Starting upload: ${file.originalname} (${file.size} bytes)`);
         
         // Check if file already exists
         const existingFiles = await driveService.files.list({
@@ -243,26 +258,15 @@ async function uploadFileToDrive(file, folderId) {
             };
         }
         
-        const response = await driveService.files.create({
-            requestBody: {
-                name: file.originalname,
-                parents: [folderId]
-            },
-            media: {
-                mimeType: file.mimetype,
-                body: require('stream').Readable.from(file.buffer)
-            },
-            fields: 'id, name, size'
-        });
+        // Use resumable upload for files larger than 5MB
+        if (file.size > 5 * 1024 * 1024) {
+            console.log(`Using resumable upload for large file: ${file.originalname}`);
+            return await resumableUpload(file, folderId);
+        } else {
+            console.log(`Using simple upload for small file: ${file.originalname}`);
+            return await simpleUpload(file, folderId);
+        }
         
-        console.log(`Successfully uploaded: ${file.originalname}`);
-        
-        return {
-            success: true,
-            fileName: file.originalname,
-            fileId: response.data.id,
-            size: file.size
-        };
     } catch (error) {
         console.error(`Error uploading ${file.originalname}:`, error);
         return {
@@ -270,6 +274,106 @@ async function uploadFileToDrive(file, folderId) {
             fileName: file.originalname,
             error: error.message
         };
+    }
+}
+
+// Simple upload for small files
+async function simpleUpload(file, folderId) {
+    const response = await driveService.files.create({
+        requestBody: {
+            name: file.originalname,
+            parents: [folderId]
+        },
+        media: {
+            mimeType: file.mimetype,
+            body: Readable.from(file.buffer)
+        },
+        fields: 'id, name, size'
+    });
+    
+    console.log(`Successfully uploaded (simple): ${file.originalname}`);
+    
+    return {
+        success: true,
+        fileName: file.originalname,
+        fileId: response.data.id,
+        size: file.size
+    };
+}
+
+// Resumable upload for large files
+async function resumableUpload(file, folderId) {
+    try {
+        // Step 1: Initiate resumable upload session
+        const authClient = await driveService.context._options.auth.getAccessToken();
+        const accessToken = authClient.token;
+        
+        const metadata = {
+            name: file.originalname,
+            parents: [folderId]
+        };
+        
+        // Initialize resumable upload
+        const initResponse = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${accessToken}`,
+                'Content-Type': 'application/json',
+                'X-Upload-Content-Type': file.mimetype,
+                'X-Upload-Content-Length': file.size.toString()
+            },
+            body: JSON.stringify(metadata)
+        });
+        
+        if (!initResponse.ok) {
+            throw new Error(`Failed to initialize resumable upload: ${initResponse.status}`);
+        }
+        
+        const uploadUrl = initResponse.headers.get('location');
+        console.log(`Resumable upload session started for: ${file.originalname}`);
+        
+        // Step 2: Upload file in chunks
+        let uploadedBytes = 0;
+        const chunkSize = CONFIG.CHUNK_SIZE;
+        
+        while (uploadedBytes < file.size) {
+            const start = uploadedBytes;
+            const end = Math.min(uploadedBytes + chunkSize, file.size);
+            const chunk = file.buffer.slice(start, end);
+            
+            console.log(`Uploading chunk: ${start}-${end-1}/${file.size} for ${file.originalname}`);
+            
+            const chunkResponse = await fetch(uploadUrl, {
+                method: 'PUT',
+                headers: {
+                    'Content-Range': `bytes ${start}-${end-1}/${file.size}`,
+                    'Content-Length': chunk.length.toString()
+                },
+                body: chunk
+            });
+            
+            if (chunkResponse.status === 308) {
+                // Continue uploading
+                uploadedBytes = end;
+            } else if (chunkResponse.status === 200 || chunkResponse.status === 201) {
+                // Upload complete
+                const result = await chunkResponse.json();
+                console.log(`Successfully uploaded (resumable): ${file.originalname}`);
+                
+                return {
+                    success: true,
+                    fileName: file.originalname,
+                    fileId: result.id,
+                    size: file.size
+                };
+            } else {
+                throw new Error(`Chunk upload failed: ${chunkResponse.status}`);
+            }
+        }
+        
+    } catch (error) {
+        console.error(`Resumable upload failed for ${file.originalname}:`, error);
+        throw error;
     }
 }
 
@@ -306,6 +410,7 @@ async function startServer() {
     app.listen(PORT, () => {
         console.log(`🚀 Upload server running on port ${PORT}`);
         console.log(`📁 Uploads will go to Google Drive folder: ${CONFIG.MAIN_FOLDER_ID}`);
+        console.log(`🔄 Chunked upload enabled for files > 5MB`);
     });
 }
 
