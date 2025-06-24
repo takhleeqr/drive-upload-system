@@ -238,7 +238,7 @@ async function createFolder(name, parentId) {
 }
 
 // Enhanced file upload function with resumable upload for large files
-async function uploadFileTorive(file, folderId) {
+async function uploadFileToDrive(file, folderId) {
     try {
         console.log(`Starting upload: ${file.originalname} (${file.size} bytes)`);
         
